@@ -374,7 +374,6 @@ then
 fi
 
 # explode and implode
-echo "######## explode and implode *･゜ﾟ･*:.｡..｡.:*･'(*ﾟ▽ﾟ*)'･*:.｡. .｡.:*･゜ﾟ･*#######"
 rm -rf ${RUMPOBJ}/explode
 mkdir -p ${RUMPOBJ}/explode/libc
 mkdir -p ${RUMPOBJ}/explode/rumpkernel
