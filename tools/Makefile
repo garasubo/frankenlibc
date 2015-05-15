@@ -7,7 +7,7 @@ BIN=$(BINDIR)/rexec
 OBJ=$(OBJDIR)/rexec.o
 INC=rexec.h
 DEPS=$(INC) $(OBJDIR) $(BINDIR)
-PLATFORMS=freebsd linux netbsd qemu-arm
+PLATFORMS=freebsd linux netbsd qemu-arm twrls1021a
 
 default:		linux
 
@@ -40,6 +40,10 @@ netbsd:			$(OBJ) $(OBJDIR)/netbsd.o
 
 qemu-arm:		qemu-arm.sh
 			cp qemu-arm.sh $(BIN)
+
+twrls1021a:
+			cp twrls1021a.sh $(BIN)
+
 
 .PHONY:			clean $(PLATFORMS)
 clean:		
