@@ -34,8 +34,8 @@ OBJ+=$(OBJDIR)/write.o
 OBJ+=$(OBJDIR)/writev.o
 HEADERS=$(CRTDIR) $(OBJDIR)
 INCLUDES=-I../include -I../../franken/include -I.
-CPPFLAGS+=-nostdinc $(INCLUDES)
-CFLAGS+=-fno-stack-protector
+CPPFLAGS+=-nostdinc $(INCLUDES) -mfpu=neon
+CFLAGS+=-fno-stack-protector -mfpu=neon
 RANLIB?=ranlib
 
 default:			$(OBJ)
