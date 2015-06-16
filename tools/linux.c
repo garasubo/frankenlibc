@@ -10,11 +10,20 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <linux/fs.h>
 #include <net/if.h>
+#include <arpa/inet.h>
 #include <linux/if_tun.h>
+#include <linux/sockios.h>
+#include <sys/socket.h>
+#include <linux/if_packet.h>
+#include <linux/capability.h>
 
 #include "rexec.h"
+
+/* only in libcap header, not linux header */
+int capset(cap_user_header_t, cap_user_data_t);
 
 /* only in linux/fcntl.h that cannot be included */
 #ifndef AT_EMPTY_PATH
@@ -43,10 +52,13 @@
 
 #ifndef SECCOMP
 int
-filter_init(char *program)
+os_init(char *program, int nx)
 {
-	int ret;
 
+	if (nx == 1) {
+		fprintf(stderr, "cannot disable mprotect execution\n");
+		exit(1);
+	}
 	return 0;
 }
 
@@ -58,9 +70,22 @@ filter_fd(int fd, int flags, struct stat *st)
 }
 
 int
+os_emptydir()
+{
+
+	return 0;
+}
+
+int
+os_pre()
+{
+
+	return 0;
+}
+
+int
 filter_load_exec(char *program, char **argv, char **envp)
 {
-	int ret;
 
 	if (execve(program, argv, envp) == -1) {
 		perror("execve");
@@ -80,14 +105,27 @@ filter_load_exec(char *program, char **argv, char **envp)
 
 scmp_filter_ctx ctx;
 
+#ifdef EXECVEAT
+int pfd = -1;
+#endif
+
 int
-filter_init(char *program)
+os_init(char *program, int nx)
 {
 	int ret, i;
 
 	ctx = seccomp_init(SCMP_ACT_KILL);
 	if (ctx == NULL)
 		return -1;
+
+#ifdef EXECVEAT
+        pfd = open(program, O_RDONLY | O_CLOEXEC);
+
+        if (pfd == -1) {
+                perror("open");
+                exit(1);
+        }
+#endif
 
 	/* arch_prctl(ARCH_SET_FS, x) */
 #ifdef SYS_arch_prctl
@@ -127,14 +165,24 @@ filter_init(char *program)
 
 	/* mmap(a, b, c, d, -1, e) */
 #ifdef SYS_mmap2
-	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap2), 0);
+#define MMAP SCMP_SYS(mmap2)
 #else
-	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
+#define MMAP SCMP_SYS(mmap)
 #endif
+	if (nx == 0)
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, MMAP, 1,
+			SCMP_A4(SCMP_CMP_EQ, -1));
+	else
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, MMAP, 2,
+			SCMP_A2(SCMP_CMP_MASKED_EQ, PROT_EXEC, 0), SCMP_A4(SCMP_CMP_EQ, -1));
 	if (ret < 0) return ret;
 
-	/* mprotect(a, b, c) XXX allow disable exec */
-	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 0);
+	/* mprotect(a, b, c) */
+	if (nx == 0)
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 0);
+	else /* do not allow executable pages */
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 1,
+			SCMP_A2(SCMP_CMP_MASKED_EQ, PROT_EXEC, 0));
 	if (ret < 0) return ret;
 
 	/* munmap(a, b) */
@@ -152,6 +200,13 @@ filter_init(char *program)
 	/* allow ppoll for network readiness */
 	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ppoll), 0);
 	if (ret < 0) return ret;
+
+	return 0;
+}
+
+int
+os_pre()
+{
 
 	return 0;
 }
@@ -197,8 +252,13 @@ filter_fd(int fd, int flags, struct stat *st)
 	if (ret < 0) return ret;
 
 	/* fcntl(fd, F_GETFL, ...) */
+#ifdef SYS_fcntl64
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl64), 2,
+		SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, F_GETFL));
+#else
 	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 2,
 		SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, F_GETFL));
+#endif
 	if (ret < 0) return ret;
 
 	/* ioctl(fd, BLKGETSIZE64) for block devices */
@@ -220,10 +280,25 @@ filter_fd(int fd, int flags, struct stat *st)
 			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFHWADDR));
 		if (ret < 0) return ret;
 	}
-	/* XXX be more specific only for our dummy socket */
+	/* XXX for dummy socket and packet sockets */
 	if (S_ISSOCK(st->st_mode)) {
 		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
 			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFHWADDR));
+		if (ret < 0) return ret;
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
+			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFNAME));
+		if (ret < 0) return ret;
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
+			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFADDR));
+		if (ret < 0) return ret;
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
+			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFBRDADDR));
+		if (ret < 0) return ret;
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
+			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFNETMASK));
+		if (ret < 0) return ret;
+		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(getsockname), 1,
+			SCMP_A0(SCMP_CMP_EQ, fd));
 		if (ret < 0) return ret;
 	}
 
@@ -232,7 +307,7 @@ filter_fd(int fd, int flags, struct stat *st)
 
 /* without being able to exec a file descriptor, we cannot lock down as
    much, but this is only a very recent facility in Linux */
-#ifdef SYS_execveat
+#ifdef EXECVEAT
 /* not yet defined by libc */
 int execveat(int, const char *, char *const [], char *const [], int);
 
@@ -245,36 +320,36 @@ execveat(int dirfd, const char *pathname,
 }
 
 int
+os_emptydir()
+{
+
+	return emptydir();
+}
+
+int
 filter_load_exec(char *program, char **argv, char **envp)
 {
 	int ret;
 	const char *emptystring = "";
-	int fd = open(program, O_RDONLY | O_CLOEXEC);
-
-	if (fd == -1) {
-		perror("open");
-		exit(1);
-	}
 
 	/* lock down execveat to exactly what we need to exec program */
 	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(execveat), 5,
-		SCMP_A0(SCMP_CMP_EQ, fd),
+		SCMP_A0(SCMP_CMP_EQ, pfd),
 		SCMP_A1(SCMP_CMP_EQ, (long)emptystring),
 		SCMP_A2(SCMP_CMP_EQ, (long)argv),
 		SCMP_A3(SCMP_CMP_EQ, (long)envp),
 		SCMP_A4(SCMP_CMP_EQ, AT_EMPTY_PATH));
 	if (ret < 0) return ret;
-	ret = emptydir();
-	if (ret < 0) return ret;
-
-	/* seccomp_export_pfc(ctx, 1); */
 
 	ret = seccomp_load(ctx);
-	if (ret < 0) return ret;
+	if (ret < 0) {
+		fprintf(stderr, "seccomp_load failed, probably no kernel support\n");
+		return ret;
+	}
 
 	seccomp_release(ctx);
 
-	if (execveat(fd, emptystring, argv, envp, AT_EMPTY_PATH) == -1) {
+	if (execveat(pfd, emptystring, argv, envp, AT_EMPTY_PATH) == -1) {
 		perror("execveat");
 		exit(1);
 	}
@@ -283,14 +358,20 @@ filter_load_exec(char *program, char **argv, char **envp)
 }
 #else /* execveat */
 int
+os_emptydir()
+{
+
+	/* need to be able to see executable */
+	return 0;
+}
+
+int
 filter_load_exec(char *program, char **argv, char **envp)
 {
 	int ret;
 
 	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(execve), 0);
 	if (ret < 0) return ret;
-
-	/* seccomp_export_pfc(ctx, 1); */
 
 	ret = seccomp_load(ctx);
 	if (ret < 0) return ret;
@@ -317,11 +398,25 @@ getrandom(void *buf, size_t buflen, unsigned int flags)
 	return syscall(SYS_getrandom, buf, buflen, flags);
 }
 
+void
+os_dropcaps()
+{
+	struct __user_cap_header_struct hdr = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+	struct __user_cap_data_struct data[2];
+
+	memset(data, 0, sizeof(data));
+	if (capset(&hdr, data) == -1) {
+		perror("capset");
+		exit(1);
+	}
+}
+
 int
-os_pre()
+os_extrafiles()
 {
 	int sock[2];
-	int ret, fd;
+	int ret;
+	int fd __attribute__((unused));
 	char buf[1];
 
 	/* if getrandom() syscall works we do not need to pass random source in */
@@ -329,8 +424,8 @@ os_pre()
 		fd = open("/dev/urandom", O_RDONLY);
 	}
 
-	/* Linux needs a socket to do ioctls on to get mac addresses */
-	/* XXX Add a tap ioctl to get hwaddr */
+	/* Linux needs a socket to do ioctls on to get mac addresses from macvtap devices */
+	/* Fix upstreamed */
 	ret = socketpair(AF_UNIX, SOCK_STREAM, 0, sock);
 	close(sock[1]);
 
@@ -349,14 +444,50 @@ os_open(char *pre, char *post)
 		strncpy(ifr.ifr_name, post, IFNAMSIZ);
 		ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
 
-		fd = open("/dev/net/tun", O_RDWR);
-		if (fd == -1)
+		fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+		if (fd == -1) {
+			perror("open /dev/net/tun");
 			return -1;
+		}
 
-		if (ioctl(fd, TUNSETIFF, &ifr) == -1)
+		if (ioctl(fd, TUNSETIFF, &ifr) == -1) {
+			perror("TUNSETIFF");
 			return -1;
+		}
 
 		return fd;
+	}
+
+	/* eg packet:eth0 for packet socket on eth0 */
+	if (strcmp(pre, "packet") == 0) {
+		struct ifreq ifr;
+		int sock, flags;
+		struct sockaddr_ll sa = {0};
+
+		sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+		if (sock == -1) {
+			/* probably missing CAP_NET_RAW */
+			perror("socket AF_PACKET");
+			return -1;
+		}
+		strncpy(ifr.ifr_name, post, IFNAMSIZ);
+		if (ioctl(sock, SIOCGIFINDEX, &ifr) == -1)
+			return -1;
+
+		sa.sll_family = AF_PACKET;
+		sa.sll_ifindex = ifr.ifr_ifindex;
+		sa.sll_halen = ETH_ALEN;
+		sa.sll_protocol = htons(ETH_P_ALL);
+		if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
+			perror("bind AF_PACKET");
+			return -1;
+		}
+		flags = fcntl(sock, F_GETFL, 0);
+		if (flags == -1)
+			return -1;
+		if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1)
+			return -1;
+		return sock;
 	}
 
 	fprintf(stderr, "platform does not support %s:%s\n", pre, post);

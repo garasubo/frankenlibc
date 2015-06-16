@@ -13,12 +13,37 @@
 
 #include "rexec.h"
 
+int pfd = -1;
+
 #ifdef NOCAPSICUM
 int
-filter_init(char *program)
+os_init(char *program, int nx)
+{
+
+	if (nx == 1) {
+		fprintf(stderr, "cannot disable mprotect execution\n");
+		exit(1);
+	}
+
+	pfd = open(program, O_EXEC | O_CLOEXEC);
+	if (pfd == -1) {
+		perror("open");
+		exit(1);
+	}
+
+	return 0;
+}
+
+int
+os_pre()
 {
 
 	return 0;
+}
+
+void
+os_dropcaps()
+{
 }
 
 int
@@ -27,55 +52,42 @@ filter_fd(int fd, int flags, struct stat *st)
 
 	return 0;
 }
+#else
+
+#include <sys/capability.h>
 
 int
-filter_load_exec(char *program, char **argv, char **envp)
+os_init(char *program, int nx)
 {
-	int ret, pfd;
 
+	if (nx == 1) {
+		fprintf(stderr, "cannot disable mprotect execution\n");
+		exit(1);
+	}
 	pfd = open(program, O_EXEC | O_CLOEXEC);
 	if (pfd == -1) {
 		perror("open");
-		exit(1);
-	}
-
-	emptydir();
-
-	if (fexecve(pfd, argv, envp) == -1) {
-		perror("fexecve");
 		exit(1);
 	}
 
 	return 0;
 }
-#else
-
-#include <sys/capability.h>
-
-int pfd = -1;
 
 int
-filter_init(char *program)
+os_pre()
 {
-	cap_rights_t rights;
-	int ret;
-
-	pfd = open(program, O_EXEC | O_CLOEXEC);
-	if (pfd == -1) {
-		perror("open");
-		exit(1);
-	}
 
 	if (cap_enter() == -1) {
 		perror("cap_enter");
 		exit(1);
 	}
 
-	cap_rights_init(&rights, CAP_READ, CAP_FEXECVE);
-	ret = cap_rights_limit(pfd, &rights);
-	if (ret == -1) return ret;
-
 	return 0;
+}
+
+void
+os_dropcaps()
+{
 }
 
 int
@@ -86,8 +98,14 @@ filter_fd(int fd, int flags, struct stat *st)
 	unsigned long ioctlb[1] = {DIOCGMEDIASIZE};
 	unsigned long ioctlc[1] = {SIOCGIFADDR};
 
-	/* XXX we could cut capabilities down a little further */
+	if (fd == pfd) {
+		cap_rights_init(&rights, CAP_READ, CAP_FEXECVE);
+		ret = cap_rights_limit(pfd, &rights);
+		if (ret == -1) return ret;
+		return 0;
+	}
 
+	/* XXX we could cut capabilities down a little further */
 	switch (flags & O_ACCMODE) {
 	case O_RDONLY:
 		if (S_ISBLK(st->st_mode) || S_ISCHR(st->st_mode)) {
@@ -138,6 +156,7 @@ filter_fd(int fd, int flags, struct stat *st)
 
 	return 0;
 }
+#endif /* CAPSICUM */
 
 int
 filter_load_exec(char *program, char **argv, char **envp)
@@ -150,10 +169,16 @@ filter_load_exec(char *program, char **argv, char **envp)
 
 	return 0;
 }
-#endif /* CAPSICUM */
 
 int
-os_pre()
+os_emptydir()
+{
+
+	return emptydir();
+}
+
+int
+os_extrafiles()
 {
 
 	return 0;

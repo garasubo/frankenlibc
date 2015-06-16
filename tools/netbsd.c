@@ -8,9 +8,13 @@
 #include "rexec.h"
 
 int
-filter_init(char *program)
+os_init(char *program, int nx)
 {
 
+	if (nx == 1) {
+		fprintf(stderr, "cannot disable mprotect execution\n");
+		exit(1);
+	}
 	return 0;
 }
 
@@ -22,9 +26,20 @@ filter_fd(int fd, int flags, struct stat *st)
 }
 
 int
+os_pre()
+{
+
+	return 0;
+}
+
+void
+os_dropcaps()
+{
+}
+
+int
 filter_load_exec(char *program, char **argv, char **envp)
 {
-	int ret;
 
 	if (execve(program, argv, envp) == -1) {
 		perror("execve");
@@ -35,7 +50,15 @@ filter_load_exec(char *program, char **argv, char **envp)
 }
 
 int
-os_pre()
+os_emptydir()
+{
+
+	/* no fexec functionality, need to be able to see executable */
+	return 0;
+}
+
+int
+os_extrafiles()
 {
 
 	return 0;

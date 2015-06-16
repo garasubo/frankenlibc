@@ -1,4 +1,4 @@
-/*	$NetBSD: if_bge.c,v 1.290 2015/05/18 01:06:35 msaitoh Exp $	*/
+/*	$NetBSD: if_bge.c,v 1.292 2015/06/14 08:46:33 martin Exp $	*/
 
 /*
  * Copyright (c) 2001 Wind River Systems
@@ -79,7 +79,7 @@
  */
 
 #include <sys/cdefs.h>
-__KERNEL_RCSID(0, "$NetBSD: if_bge.c,v 1.290 2015/05/18 01:06:35 msaitoh Exp $");
+__KERNEL_RCSID(0, "$NetBSD: if_bge.c,v 1.292 2015/06/14 08:46:33 martin Exp $");
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -4745,7 +4745,6 @@ bge_intr(void *xsc)
 	if (sc->bge_flags & BGEF_TAGGED_STATUS) {
 		if (sc->bge_lasttag == statustag &&
 		    (~pcistate & intrmask)) {
-			printf("[SP]");
 			return (0);
 		}
 		sc->bge_lasttag = statustag;
@@ -4864,7 +4863,8 @@ bge_tick(void *xsc)
 
 	bge_asf_driver_up(sc);
 
-	callout_reset(&sc->bge_timeout, hz, bge_tick, sc);
+	if (!sc->bge_detaching)
+		callout_reset(&sc->bge_timeout, hz, bge_tick, sc);
 
 	splx(s);
 }
@@ -5891,9 +5891,10 @@ bge_stop(struct ifnet *ifp, int disable)
 {
 	struct bge_softc *sc = ifp->if_softc;
 
-	if (disable)
+	if (disable) {
+		sc->bge_detaching = 1;
 		callout_halt(&sc->bge_timeout, NULL);
-	else
+	} else
 		callout_stop(&sc->bge_timeout);
 
 	/* Disable host interrupts. */

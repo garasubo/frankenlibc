@@ -8,25 +8,37 @@ RUMPSRC=${PWD}/src
 OUTDIR=${PWD}/rump
 NCPU=1
 
+EXTRA_AFLAGS="-Wa,--noexecstack"
+
 TARGET=$(LC_ALL=C ${CC-cc} -v 2>&1 | sed -n 's/^Target: //p' )
 
 case ${TARGET} in
 *-linux*)
 	OS=linux
-	FILTER="-DNOSECCOMP"
-	NCPU=$(nproc )
 	;;
 *-netbsd*)
 	OS=netbsd
-	NCPU=$(sysctl -n hw.ncpu )
 	;;
 *-freebsd*)
 	OS=freebsd
 	FILTER="-DCAPSICUM"
-	NCPU=$(sysctl -n hw.ncpu )
 	;;
 *)
 	OS=unknown
+esac
+
+HOST=$(uname -s)
+
+case ${HOST} in
+Linux)
+	NCPU=$(nproc)
+	;;
+NetBSD)
+	NCPU=$(sysctl -n hw.ncpu)
+	;;
+FreeBSD)
+	NCPU=$(sysctl -n hw.ncpu)
+	;;
 esac
 
 STDJ="-j ${NCPU}"
@@ -43,9 +55,11 @@ helpme()
 	printf "\t-p: huge page size to use eg 2M or 1G\n"
 	printf "\t-r: release build, without debug settings\n"
 	printf "\t-s: location of source tree.  default: PWD/rumpsrc\n"
-	printf "\t-o: location of object files. defaule PWD/rumpobj\n"
-	printf "\t-d: location of installed files. defaule PWD/rump\n"
+	printf "\t-o: location of object files. default PWD/rumpobj\n"
+	printf "\t-d: location of installed files. default PWD/rump\n"
+	printf "\t-b: location of binaries. default PWD/rump/bin\n"
 	printf "\tseccomp|noseccomp: select Linux seccomp (default off)\n"
+	printf "\texecveat: use new linux execveat call default off)\n"
 	printf "\tcapsicum|nocapsicum: select FreeBSD capsicum (default on)\n"
 	printf "\tdeterministic: make deterministic\n"
 	printf "\tnotests: do not run tests\n"
@@ -53,7 +67,7 @@ helpme()
 	printf "\tclean: clean object directory first\n"
 	printf "Other options are passed to buildrump.sh\n"
 	printf "\n"
-	printf "Supported platforms are currently: linux, netbsd, freebsd, qemu-arm\n"
+	printf "Supported platforms are currently: linux, netbsd, freebsd, qemu-arm, spike\n"
 	exit 1
 }
 
@@ -107,8 +121,12 @@ appendvar ()
 
 . ./buildrump/subr.sh
 
-while getopts '?d:F:Hhj:L:M:m:o:p:qrs:V:' opt; do
+while getopts '?b:d:F:Hhj:L:M:m:o:p:qrs:V:' opt; do
 	case "$opt" in
+	"b")
+		mkdir -p ${OPTARG}
+		BINDIR=$(abspath ${OPTARG})
+		;;
 	"d")
 		mkdir -p ${OPTARG}
 		OUTDIR=$(abspath ${OPTARG})
@@ -197,16 +215,23 @@ while getopts '?d:F:Hhj:L:M:m:o:p:qrs:V:' opt; do
 done
 shift $((${OPTIND} - 1))
 
+if [ -z ${BINDIR+x} ]; then BINDIR=${OUTDIR}/bin; fi
+
 for arg in "$@"; do
         case ${arg} in
 	"clean")
 		${MAKE} clean
 		;;
 	"noseccomp")
-		FILTER="-DNOSECCOMP"
 		;;
 	"seccomp")
-		FILTER="-DSECCOMP"
+		appendvar FILTER "-DSECCOMP"
+		appendvar TOOLS_LDLIBS "-lseccomp"
+		;;
+	"noexecveat")
+		;;
+	"execveat")
+		appendvar FILTER "-DEXECVEAT"
 		;;
 	"nocapsicum")
 		FILTER="-DNOCAPSICUM"
@@ -246,6 +271,20 @@ fi
 RUNTESTS="${RUNTESTS-test}"
 MAKETOOLS="${MAKETOOLS-yes}"
 
+rm -rf ${OUTDIR}
+
+FRANKEN_CFLAGS="-std=c99 -Wall -Wextra -Wno-missing-braces -Wno-unused-parameter -Wno-missing-field-initializers"
+
+if [ "${HOST}" = "Linux" ]; then appendvar FRANKEN_CFLAGS "-D_GNU_SOURCE"; fi
+
+CPPFLAGS="${EXTRA_CPPFLAGS} ${FILTER}" \
+        CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${FRANKEN_CFLAGS}" \
+        LDFLAGS="${EXTRA_LDFLAGS}" \
+        LDLIBS="${TOOLS_LDLIBS}" \
+        RUMPOBJ="${RUMPOBJ}" \
+        RUMP="${RUMP}" \
+        ${MAKE} ${OS} -C tools
+
 ./buildrump/buildrump.sh \
 	-V RUMP_CURLWP=hypercall -V RUMP_LOCKS_UP=yes \
 	-V MKPIC=no -V RUMP_KERNEL_IS_LIBC=1 \
@@ -277,19 +316,42 @@ rm -f ${RUMP}/lib/librumpdev_ubt.a
 rm -f ${RUMP}/lib/librumpkern_sys_linux.a
 rm -f ${RUMP}/lib/librumpdev_umass.a
 
-CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${HUGEPAGESIZE}" \
+# userspace libraries to build from NetBSD base
+USER_LIBS="m pthread z crypt util prop rmt ipsec"
+NETBSDLIBS="${RUMPSRC}/lib/libc"
+for f in ${USER_LIBS}
+do
+        appendvar NETBSDLIBS "${RUMPSRC}/lib/lib${f}"
+done
+
+RUMPMAKE=${RUMPOBJ}/tooldir/rumpmake
+
+usermtree ${RUMP}
+userincludes ${RUMPSRC} ${NETBSDLIBS}
+
+for lib in ${NETBSDLIBS}; do
+        makeuserlib ${lib}
+done
+
+# permissions set wrong
+chmod -R ug+rw ${RUMP}/include/*
+# install headers
+${INSTALL-install} -d ${OUTDIR}/include
+cp -a ${RUMP}/include/* ${OUTDIR}/include
+
+CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${HUGEPAGESIZE} ${FRANKEN_CFLAGS}" \
 	AFLAGS="${EXTRA_AFLAGS} ${DBG_F}" \
 	ASFLAGS="${EXTRA_AFLAGS} ${DBG_F}" \
 	LDFLAGS="${EXTRA_LDFLAGS}" \
 	CPPFLAGS="${EXTRA_CPPFLAGS}" \
 	RUMPOBJ="${RUMPOBJ}" \
 	RUMP="${RUMP}" \
-	${MAKE} ${OS} -C platform
+	${MAKE} ${STDJ} ${OS} -C platform
 
 # should clean up how deterministic build is done
 if [ ${DETERMINSTIC-x} = "deterministic" ]
 then
-	CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${HUGEPAGESIZE}" \
+	CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${HUGEPAGESIZE} ${FRANKEN_CFLAGS}" \
 	AFLAGS="${EXTRA_AFLAGS} ${DBG_F}" \
 	ASFLAGS="${EXTRA_AFLAGS} ${DBG_F}" \
 	LDFLAGS="${EXTRA_LDFLAGS}" \
@@ -299,57 +361,39 @@ then
 	${MAKE} deterministic -C platform
 fi 
 
-CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${HUGEPAGESIZE}" \
+CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${HUGEPAGESIZE} ${FRANKEN_CFLAGS}" \
 	AFLAGS="${EXTRA_AFLAGS} ${DBG_F}" \
 	ASFLAGS="${EXTRA_AFLAGS} ${DBG_F}" \
 	LDFLAGS="${EXTRA_LDFLAGS}" \
 	CPPFLAGS="${EXTRA_CPPFLAGS} ${FRANKEN_FLAGS}" \
 	RUMPOBJ="${RUMPOBJ}" \
 	RUMP="${RUMP}" \
-	${MAKE} -C franken
+	${MAKE} ${STDJ} -C franken
 
-CFLAGS="${EXTRA_CFLAGS} ${DBG_F}" \
+CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${FRANKEN_CFLAGS}" \
 	LDFLAGS="${EXTRA_LDFLAGS}" \
 	CPPFLAGS="${EXTRA_CPPFLAGS} ${RUMPUSER_FLAGS}" \
 	RUMPOBJ="${RUMPOBJ}" \
 	RUMP="${RUMP}" \
-	${MAKE} -C librumpuser
+	${MAKE} ${STDJ} -C librumpuser
 
-if [ ${FILTER-x} = "-DSECCOMP" ]; then LDLIBS="-lseccomp"; fi
-CPPFLAGS="${EXTRA_CPPFLAGS} ${FILTER}" \
-	CFLAGS="${EXTRA_CFLAGS} ${DBG_F}" \
-	LDFLAGS="${EXTRA_LDFLAGS}" \
-	LDLIBS="${LDLIBS}" \
-	RUMPOBJ="${RUMPOBJ}" \
-	RUMP="${RUMP}" \
-	${MAKE} ${OS} -C tools
-
-CFLAGS="${EXTRA_CFLAGS} ${DBG_F}" \
+CFLAGS="${EXTRA_CFLAGS} ${DBG_F} ${FRANKEN_CFLAGS}" \
 	LDFLAGS="${EXTRA_LDFLAGS}" \
 	CPPFLAGS="${EXTRA_CPPFLAGS} ${RUMPUSER_FLAGS}" \
 	RUMPOBJ="${RUMPOBJ}" \
 	RUMP="${RUMP}" \
-	${MAKE} -C libvirtif
+	${MAKE} ${STDJ} -C libvirtif
 
-# userspace libraries to build from NetBSD base
-USER_LIBS="m pthread z crypt util prop rmt ipsec"
-NETBSDLIBS="${RUMPSRC}/lib/libc"
-for f in ${USER_LIBS}
-do
-	appendvar NETBSDLIBS "${RUMPSRC}/lib/lib${f}"
-done
-
-RUMPMAKE=${RUMPOBJ}/tooldir/rumpmake
-
-usermtree ${RUMP}
-userincludes ${RUMPSRC} ${NETBSDLIBS}
-
-for lib in ${NETBSDLIBS}; do
-	makeuserlib ${lib}
-done
+(
+	cd libtc
+	${RUMPMAKE}
+	cp libfranken_tc.a ${RUMP}/lib/
+	${RUMPMAKE} clean
+)
 
 # find which libs we should link
 ALL_LIBS="${RUMP}/lib/librump.a
+	${RUMP}/lib/libfranken_tc.a
 	${RUMP}/lib/librumpdev*.a
 	${RUMP}/lib/librumpnet*.a
 	${RUMP}/lib/librumpfs*.a
@@ -358,7 +402,7 @@ ALL_LIBS="${RUMP}/lib/librump.a
 
 if [ ! -z ${LIBS+x} ]
 then
-	ALL_LIBS="${RUMP}/lib/librump.a"
+	ALL_LIBS="${RUMP}/lib/librump.a ${RUMP}/lib/libfranken_tc.a"
 	for l in $(echo ${LIBS} | tr "," " ")
 	do
 		case ${l} in
@@ -421,10 +465,8 @@ mkdir -p ${RUMPOBJ}/explode/platform
 )
 
 # install to OUTDIR
-rm -rf ${OUTDIR}
-${INSTALL-install} -d ${OUTDIR}/bin ${OUTDIR}/lib ${OUTDIR}/include
-rm -rf ${OUTDIR}/bin/* ${OUTDIR}/lib/* ${OUTDIR}/include/*
-${INSTALL-install} ${RUMP}/bin/rexec ${OUTDIR}/bin
+${INSTALL-install} -d ${BINDIR} ${OUTDIR}/lib
+${INSTALL-install} ${RUMP}/bin/rexec ${BINDIR}
 (
 	cd ${RUMP}/lib
 	for f in ${USER_LIBS}
@@ -435,9 +477,6 @@ ${INSTALL-install} ${RUMP}/bin/rexec ${OUTDIR}/bin
 ${INSTALL-install} ${RUMP}/lib/*.o ${OUTDIR}/lib
 [ -f ${RUMP}/lib/libg.a ] && ${INSTALL-install} ${RUMP}/lib/libg.a ${OUTDIR}/lib
 ${INSTALL-install} ${RUMPOBJ}/explode/libc.a ${OUTDIR}/lib
-# permissions set wrong
-chmod -R ug+rw ${RUMP}/include/*
-cp -a ${RUMP}/include/* ${OUTDIR}/include
 
 # create toolchain wrappers
 # select these based on compiler defs
@@ -449,7 +488,7 @@ if $(${CC-cc} -v 2>&1 | grep -q clang)
 then
 	TOOL_PREFIX=$(basename $(ls ${RUMPOBJ}/tooldir/bin/*-clang) | sed -e 's/-clang//' -e 's/--/-rumprun-/')
 	# possibly some will need to be filtered if compiler complains. Also de-dupe.
-	COMPILER_FLAGS="-fno-stack-protector ${EXTRA_CPPFLAGS} ${UNDEF} ${EXTRA_CFLAGS} ${EXTRA_LDSCRIPT_CC}"
+	COMPILER_FLAGS="-fno-stack-protector -Wno-unused-command-line-argument ${EXTRA_CPPFLAGS} ${UNDEF} ${EXTRA_CFLAGS} ${EXTRA_LDSCRIPT_CC}"
 	COMPILER_FLAGS="$(echo ${COMPILER_FLAGS} | sed 's/--sysroot=[^ ]*//g')"
 	# set up sysroot to see if it works
 	( cd ${OUTDIR} && ln -s . usr )
@@ -460,14 +499,14 @@ then
 	if ${CC-cc} -I${OUTDIR}/include --sysroot=${OUTDIR} -static ${COMPILER_FLAGS} tests/hello.c -o /dev/null 2>/dev/null
 	then
 		# can use sysroot with clang
-		printf "#!/bin/sh\n\nexec ${CC-cc} --sysroot=${OUTDIR} -static ${COMPILER_FLAGS} \"\$@\"\n" > ${OUTDIR}/bin/${TOOL_PREFIX}-clang
+		printf "#!/bin/sh\n\nexec ${CC-cc} --sysroot=${OUTDIR} -static ${COMPILER_FLAGS} \"\$@\"\n" > ${BINDIR}/${TOOL_PREFIX}-clang
 	else
 		# sysroot does not work with linker eg NetBSD
 		appendvar COMPILER_FLAGS "-I${OUTDIR}/include -L${OUTDIR}/lib -B${OUTDIR}/lib"
-		printf "#!/bin/sh\n\nexec ${CC-cc} -static ${COMPILER_FLAGS} \"\$@\"\n" > ${OUTDIR}/bin/${TOOL_PREFIX}-clang
+		printf "#!/bin/sh\n\nexec ${CC-cc} -static ${COMPILER_FLAGS} \"\$@\"\n" > ${BINDIR}/${TOOL_PREFIX}-clang
 	fi
 	COMPILER="${TOOL_PREFIX}-clang"
-	( cd ${OUTDIR}/bin
+	( cd ${BINDIR}
 	  ln -s ${COMPILER} ${TOOL_PREFIX}-cc
 	  ln -s ${COMPILER} rumprun-cc
 	)
@@ -494,21 +533,21 @@ else
 		-e "s#@ENDFILE@#${ENDFILE}#g" \
 		-e "s/--sysroot=[^ ]*//" \
 		> ${OUTDIR}/lib/${TOOL_PREFIX}gcc.spec
-	printf "#!/bin/sh\n\nexec ${CC-cc} -specs ${OUTDIR}/lib/${TOOL_PREFIX}gcc.spec ${COMPILER_FLAGS} -static -nostdinc -isystem ${OUTDIR}/include \"\$@\"\n" > ${OUTDIR}/bin/${TOOL_PREFIX}-gcc
+	printf "#!/bin/sh\n\nexec ${CC-cc} -specs ${OUTDIR}/lib/${TOOL_PREFIX}gcc.spec ${COMPILER_FLAGS} -static -nostdinc -isystem ${OUTDIR}/include \"\$@\"\n" > ${BINDIR}/${TOOL_PREFIX}-gcc
 	COMPILER="${TOOL_PREFIX}-gcc"
-	( cd ${OUTDIR}/bin
+	( cd ${BINDIR}
 	  ln -s ${COMPILER} ${TOOL_PREFIX}-cc
 	  ln -s ${COMPILER} rumprun-cc
 	)
 fi
-printf "#!/bin/sh\n\nexec ${AR-ar} \"\$@\"\n" > ${OUTDIR}/bin/${TOOL_PREFIX}-ar
-printf "#!/bin/sh\n\nexec ${NM-nm} \"\$@\"\n" > ${OUTDIR}/bin/${TOOL_PREFIX}-nm
-printf "#!/bin/sh\n\nexec ${OBJCOPY-objcopy} \"\$@\"\n" > ${OUTDIR}/bin/${TOOL_PREFIX}-objcopy
-chmod +x ${OUTDIR}/bin/${TOOL_PREFIX}-*
+printf "#!/bin/sh\n\nexec ${AR-ar} \"\$@\"\n" > ${BINDIR}/${TOOL_PREFIX}-ar
+printf "#!/bin/sh\n\nexec ${NM-nm} \"\$@\"\n" > ${BINDIR}/${TOOL_PREFIX}-nm
+printf "#!/bin/sh\n\nexec ${OBJCOPY-objcopy} \"\$@\"\n" > ${BINDIR}/${TOOL_PREFIX}-objcopy
+chmod +x ${BINDIR}/${TOOL_PREFIX}-*
 
-# test for suplicated symbols
+# test for duplicated symbols
 
-DUPSYMS=$(nm rump/lib/libc.a | grep ' T ' | sed 's/.* T //g' | sort | uniq -c -d)
+DUPSYMS=$(nm ${OUTDIR}/lib/libc.a | grep ' T ' | sed 's/.* T //g' | sort | uniq -d )
 
 if [ -n "${DUPSYMS}" ]
 then
@@ -518,59 +557,42 @@ then
 fi
 
 # install some useful applications
-
-mktool()
-{
-	echo "Building $1"
-	cd ${RUMPSRC}/$2
-	OBJDIR=${RUMPOBJ}/$1
-	mkdir -p ${OBJDIR}
-
-	LIBCRT0= \
-	LIBCRTBEGIN= \
-	LIBC="${OUTDIR}/lib/libc.a" \
-	LIBUTIL="${OUTDIR}/lib/libutil.a" \
-	LIBRMT="${OUTDIR}/lib/librmt.a" \
-	MAKESYSPATH="${RUMPSRC}/share/mk" \
-	DESTDIR=${OUTDIR} \
-	MKDOC=no \
-	MKMAN=no \
-	MKRUMP=no \
-		${RUMPOBJ}/tooldir/rumpmake CC="${OUTDIR}/bin/${COMPILER}" MAKEOBJDIR=${OBJDIR}
-	${INSTALL-install} ${OBJDIR}/$1 ${OUTDIR}/bin/rump.$1
-}
-
 if [ ${MAKETOOLS} = "yes" ]
 then
-	( mktool pax bin/pax )
-	( mktool newfs sbin/newfs )
-	( mktool fsck_ffs sbin/fsck_ffs )
-	( mktool mknod sbin/mknod )
-	( mktool mkdir bin/mkdir )
-	( mktool ls bin/ls )
-	( mktool rm bin/rm )
-	( mktool ln bin/ln )
-	( mktool dd bin/dd )
-	( mktool df bin/df )
-	( mktool mount sbin/mount )
-	( mktool ifconfig sbin/ifconfig )
-	( mktool route sbin/route )
-	( mktool ping sbin/ping )
-	( mktool ping6 sbin/ping6 )
-	( mktool rmdir bin/rmdir )
-	( mktool chmod bin/chmod )
-	( mktool chown sbin/chown )
-	(
-		cd ${OUTDIR}/bin
-		ln rump.pax rump.tar
-		ln rump.pax rump.cpio
-	)
+	CC="${BINDIR}/${COMPILER}" \
+	RUMPSRC=${RUMPSRC} \
+	RUMPOBJ=${RUMPOBJ} \
+	OUTDIR=${OUTDIR} \
+	BINDIR=${BINDIR} \
+		${MAKE} ${STDJ} -C utilities
 fi
+
+# Always make tests to exercise compiler
+CC="${BINDIR}/${COMPILER}" \
+	RUMPDIR="${OUTDIR}" \
+	RUMPOBJ="${RUMPOBJ}" \
+	BINDIR="${BINDIR}" \
+	${MAKE} ${STDJ} -C tests
+
+# test for executable stack
+case ${OS} in
+qemu-arm|spike)
+	# does not have protection
+	;;
+netbsd)
+	# XXX unclear why this is happening, needs investigating
+	readelf -lW ${RUMPOBJ}/tests/hello | grep RWE && echo "Writeable executable section (stack?) found"
+	;;
+*)
+	readelf -lW ${RUMPOBJ}/tests/hello | grep RWE && echo "Writeable executable section (stack?) found" && exit 1
+	;;
+esac
 
 if [ ${RUNTESTS} = "test" ]
 then
-	CC="${OUTDIR}/bin/${COMPILER}" \
+	CC="${BINDIR}/${COMPILER}" \
+		RUMPDIR="${OUTDIR}" \
 		RUMPOBJ="${RUMPOBJ}" \
-		OUTDIR="${OUTDIR}" \
-		${MAKE} -C tests
+		BINDIR="${BINDIR}" \
+		${MAKE} -C tests run
 fi

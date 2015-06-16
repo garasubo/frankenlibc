@@ -60,7 +60,6 @@ printk(const char *msg)
 int
 rumpuser_init(int version, const struct rumpuser_hyperup *hyp)
 {
-	int rv;
 
 	if (version != RUMPUSER_VERSION) {
 		printk("rumpuser version mismatch\n");
@@ -193,12 +192,13 @@ rumpuser_dprintf(const char *format, ...)
 	va_list ap;
 	char buffer[80];
 	int ret;
+	int size = sizeof(buffer);
 
 	va_start(ap, format);
-	ret = vsnprintf(buffer, sizeof(buffer), format, ap);
+	ret = vsnprintf(buffer, size, format, ap);
 	va_end(ap);
-	if (ret >= sizeof(buffer))
-		buffer[sizeof(buffer) - 1] = '\0';
+	if (ret >= size)
+		buffer[size - 1] = '\0';
 	write(2, buffer, strlen(buffer));
 }
 
