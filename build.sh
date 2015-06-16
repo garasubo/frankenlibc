@@ -579,6 +579,9 @@ case ${OS} in
 qemu-arm|spike)
 	# does not have protection
 	;;
+twrls1021a)
+	# does not have protection
+	;;
 netbsd)
 	# XXX unclear why this is happening, needs investigating
 	readelf -lW ${RUMPOBJ}/tests/hello | grep RWE && echo "Writeable executable section (stack?) found"

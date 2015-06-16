@@ -45,7 +45,7 @@ qemu-arm:		qemu-arm.sh $(BINDIR)
 spike:			spike.sh $(BINDIR)
 			cp spike.sh $(BIN)
 
-twrls1021a:
+twrls1021a:		twrls1021a.sh $(BINDIR)
 			cp twrls1021a.sh $(BIN)
 
 
