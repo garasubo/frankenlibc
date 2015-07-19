@@ -3,22 +3,23 @@
 #include <string.h>
 #include <time.h>
 #include <signal.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
-#include <linux/fs.h>
+#include <sys/socket.h>
 #include <net/if.h>
 #include <arpa/inet.h>
+#include <linux/fs.h>
 #include <linux/if_tun.h>
 #include <linux/sockios.h>
-#include <sys/socket.h>
 #include <linux/if_packet.h>
 #include <linux/capability.h>
+#include <linux/rtnetlink.h>
 
 #include "rexec.h"
 
@@ -56,7 +57,7 @@ os_init(char *program, int nx)
 {
 
 	if (nx == 1) {
-		fprintf(stderr, "cannot disable mprotect execution\n");
+		fprintf(stderr, "No seccomp, cannot disable mprotect execution\n");
 		exit(1);
 	}
 	return 0;
@@ -112,7 +113,7 @@ int pfd = -1;
 int
 os_init(char *program, int nx)
 {
-	int ret, i;
+	int ret;
 
 	ctx = seccomp_init(SCMP_ACT_KILL);
 	if (ctx == NULL)
@@ -122,7 +123,7 @@ os_init(char *program, int nx)
         pfd = open(program, O_RDONLY | O_CLOEXEC);
 
         if (pfd == -1) {
-                perror("open");
+                perror("open executable");
                 exit(1);
         }
 #endif
@@ -288,15 +289,6 @@ filter_fd(int fd, int flags, struct stat *st)
 		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
 			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFNAME));
 		if (ret < 0) return ret;
-		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
-			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFADDR));
-		if (ret < 0) return ret;
-		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
-			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFBRDADDR));
-		if (ret < 0) return ret;
-		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 2,
-			SCMP_A0(SCMP_CMP_EQ, fd), SCMP_A1(SCMP_CMP_EQ, SIOCGIFNETMASK));
-		if (ret < 0) return ret;
 		ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(getsockname), 1,
 			SCMP_A0(SCMP_CMP_EQ, fd));
 		if (ret < 0) return ret;
@@ -422,6 +414,10 @@ os_extrafiles()
 	/* if getrandom() syscall works we do not need to pass random source in */
 	if (getrandom(buf, 1, 0) == -1 && errno == ENOSYS) {
 		fd = open("/dev/urandom", O_RDONLY);
+		if (fd == -1) {
+			perror("open /dev/urandom");
+			exit(1);
+		}
 	}
 
 	/* Linux needs a socket to do ioctls on to get mac addresses from macvtap devices */
@@ -433,11 +429,156 @@ os_extrafiles()
 }
 
 int
+readRoutes(int sock, char *buf, size_t size, unsigned int seq, unsigned int pid)
+{
+	struct nlmsghdr *hdr;
+	int n, len = 0;
+
+	do {
+		n = recv(sock, buf, size - len, 0);
+		if (n == -1) {
+			perror("recv");
+			return -1;
+		}
+
+		hdr = (struct nlmsghdr *)buf;
+
+		if ((NLMSG_OK(hdr, n) == 0) || (hdr->nlmsg_type == NLMSG_ERROR))
+			return -1;
+
+		if (hdr->nlmsg_type == NLMSG_DONE)
+			break;
+
+		buf += n;
+		len += n;
+
+		if ((hdr->nlmsg_flags & NLM_F_MULTI) == 0)
+			break;
+
+	} while ((hdr->nlmsg_seq != seq) || (hdr->nlmsg_pid != pid));
+
+	return len;
+}
+
+int
+parseRoutes(struct nlmsghdr *hdr, struct in_addr *dst, struct in_addr *gw)
+{
+	struct rtmsg *msg;
+	struct rtattr *attr;
+	int rtlen;
+
+	msg = (struct rtmsg *)NLMSG_DATA(hdr);
+
+	if ((msg->rtm_family != AF_INET) || (msg->rtm_table != RT_TABLE_MAIN))
+		return -1;
+
+	attr = (struct rtattr *)RTM_RTA(msg);
+	rtlen = RTM_PAYLOAD(hdr);
+
+	for (; RTA_OK(attr,rtlen); attr = RTA_NEXT(attr,rtlen)) {
+		switch(attr->rta_type) {
+		case RTA_OIF:
+			break;
+		case RTA_GATEWAY:
+			memcpy(gw, RTA_DATA(attr), sizeof(struct in_addr));
+			break;
+		case RTA_PREFSRC:
+			break;
+		case RTA_DST:
+			memcpy(dst, RTA_DATA(attr), sizeof(struct in_addr));
+			break;
+		}
+	}
+
+	return 0;
+}
+
+int get_gateway(struct in_addr *gw)
+{
+	struct nlmsghdr *nlmsg;
+	char buf[8192];
+	int sock, len, seq = 0;
+	struct in_addr dest;
+	int ret = -1;
+
+	sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
+	if (sock == -1) {
+		perror("socket");
+		return -1;
+	}
+
+	nlmsg = (struct nlmsghdr *)buf;
+
+	nlmsg->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+	nlmsg->nlmsg_type = RTM_GETROUTE;
+	nlmsg->nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST;
+	nlmsg->nlmsg_seq = seq++;
+	nlmsg->nlmsg_pid = getpid();
+
+	if (send(sock, nlmsg, nlmsg->nlmsg_len, 0) == -1) {
+		perror("send");
+		return -1;
+	}
+
+	len = readRoutes(sock, buf, sizeof(buf), nlmsg->nlmsg_seq, nlmsg->nlmsg_pid);
+	if (len == -1) {
+		return -1;
+	}
+
+	for (; NLMSG_OK(nlmsg, len); nlmsg = NLMSG_NEXT(nlmsg, len)) {
+		if (parseRoutes(nlmsg, &dest, gw) == -1)
+			continue;
+
+		if (dest.s_addr == 0) { /* if dest = 0.0.0.0 ie default gw */
+			ret = 0;
+			break;
+		}
+ 	}
+
+	close(sock);
+
+	return ret;
+}
+
+int
+packet_open(char *post)
+{
+	struct ifreq ifr;
+	int sock, flags;
+	struct sockaddr_ll sa = {0};
+
+	sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	if (sock == -1) {
+		/* probably missing CAP_NET_RAW */
+		perror("socket AF_PACKET");
+		return -1;
+	}
+	strncpy(ifr.ifr_name, post, IFNAMSIZ);
+	if (ioctl(sock, SIOCGIFINDEX, &ifr) == -1)
+		return -1;
+
+	sa.sll_family = AF_PACKET;
+	sa.sll_ifindex = ifr.ifr_ifindex;
+	sa.sll_halen = ETH_ALEN;
+	sa.sll_protocol = htons(ETH_P_ALL);
+	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
+		perror("bind AF_PACKET");
+		return -1;
+	}
+	flags = fcntl(sock, F_GETFL, 0);
+	if (flags == -1)
+		return -1;
+	if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1)
+		return -1;
+	return sock;
+}
+
+int
 os_open(char *pre, char *post)
 {
 
 	/* eg tun:tap0 for tap0 */
-	if (strcmp(pre, "tun") == 0) {
+	if (strcmp(pre, "tun") == 0 || strcmp(pre, "tap") == 0) {
 		struct ifreq ifr;
 		int fd;
 
@@ -460,33 +601,64 @@ os_open(char *pre, char *post)
 
 	/* eg packet:eth0 for packet socket on eth0 */
 	if (strcmp(pre, "packet") == 0) {
+		return packet_open(post);
+	}
+
+	/* docker networking is packet socket plus fixed addresses */
+	if (strcmp(pre, "docker") == 0) {
+		int sock;
 		struct ifreq ifr;
-		int sock, flags;
-		struct sockaddr_ll sa = {0};
+		char addr[INET_ADDRSTRLEN];
+		struct sockaddr_in *sa;
+		struct in_addr gw;
+		uint32_t mask;
+		int n = 32;
 
-		sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-		if (sock == -1) {
-			/* probably missing CAP_NET_RAW */
-			perror("socket AF_PACKET");
+		if (strlen(post) == 0)
+			post = "eth0";
+
+		sock = packet_open(post);
+		if (sock == -1)
+			return -1;
+		memcpy(ifr.ifr_ifrn.ifrn_name, post, IF_NAMESIZE);
+		if (ioctl(sock, SIOCGIFADDR, &ifr) == -1)
+			return -1;
+		
+		sa = (struct sockaddr_in *)&ifr.ifr_ifru.ifru_addr;
+		inet_ntop(AF_INET, &sa->sin_addr, addr, sizeof(addr));
+	
+		setenv("FIXED_ADDRESS", addr, 1);
+
+		if (ioctl(sock, SIOCGIFNETMASK, &ifr) == -1)
+			return -1;
+
+		sa = (struct sockaddr_in *)&ifr.ifr_ifru.ifru_addr;
+		mask = ~htonl(sa->sin_addr.s_addr);
+
+		while (mask) {
+			mask >>= 1;
+			n--;
+		}
+
+		snprintf(addr, sizeof(addr), "%d", n);
+
+		setenv("FIXED_MASK", addr, 1);
+
+		if (get_gateway(&gw) == -1)
+			return -1;
+
+		inet_ntop(AF_INET, &gw, addr, sizeof(addr));
+
+		setenv("FIXED_GATEWAY", addr, 1);
+
+		/* delete address from interface */
+		sa = (struct sockaddr_in *) &ifr.ifr_ifru.ifru_addr;
+		memset(&sa->sin_addr, 0, sizeof(struct in_addr));
+		if (ioctl(sock, SIOCSIFADDR, &ifr) == -1) {
+			perror("ioctl SIOCSIFADDR (need CAP_NET_ADMIN?)");
 			return -1;
 		}
-		strncpy(ifr.ifr_name, post, IFNAMSIZ);
-		if (ioctl(sock, SIOCGIFINDEX, &ifr) == -1)
-			return -1;
 
-		sa.sll_family = AF_PACKET;
-		sa.sll_ifindex = ifr.ifr_ifindex;
-		sa.sll_halen = ETH_ALEN;
-		sa.sll_protocol = htons(ETH_P_ALL);
-		if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
-			perror("bind AF_PACKET");
-			return -1;
-		}
-		flags = fcntl(sock, F_GETFL, 0);
-		if (flags == -1)
-			return -1;
-		if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1)
-			return -1;
 		return sock;
 	}
 

@@ -8,9 +8,10 @@ OBJDIR?=$(RUMPOBJ)/utilities
 RUMPMAKE=$(RUMPOBJ)/tooldir/rumpmake
 
 UTILS=$(BINDIR)/rump.pax $(BINDIR)/rump.mkdir $(BINDIR)/rump.ls $(BINDIR)/rump.rm $(BINDIR)/rump.ln $(BINDIR)/rump.dd \
-	$(BINDIR)/rump.df $(BINDIR)/rump.rmdir $(BINDIR)/rump.chmod \
+	$(BINDIR)/rump.df $(BINDIR)/rump.rmdir $(BINDIR)/rump.chmod $(BINDIR)/rump.cat \
 	$(BINDIR)/rump.mknod $(BINDIR)/rump.mount $(BINDIR)/rump.chown $(BINDIR)/rump.ifconfig $(BINDIR)/rump.route \
 	$(BINDIR)/rump.newfs $(BINDIR)/rump.fsck_ffs $(BINDIR)/rump.ping $(BINDIR)/rump.ping6 $(BINDIR)/rump.rtadvd \
+	$(BINDIR)/rump.sysctl $(BINDIR)/rump.uname \
 	$(BINDIR)/rump.tar $(BINDIR)/rump.cpio
 
 default:			$(UTILS)
@@ -48,6 +49,9 @@ $(BINDIR)/rump.rmdir:		$(RUMPSRC)/bin/rmdir
 $(BINDIR)/rump.chmod:		$(RUMPSRC)/bin/chmod
 				RUMPMAKE=$(RUMPMAKE) CC=$(CC) OUTDIR=$(OUTDIR) RUMPSRC=$(RUMPSRC) OBJDIR=$(OBJDIR) ./util.sh chmod $(RUMPSRC)/bin/chmod $@
 
+$(BINDIR)/rump.cat:		$(RUMPSRC)/bin/cat
+				RUMPMAKE=$(RUMPMAKE) CC=$(CC) OUTDIR=$(OUTDIR) RUMPSRC=$(RUMPSRC) OBJDIR=$(OBJDIR) ./util.sh cat $(RUMPSRC)/bin/cat $@
+
 $(BINDIR)/rump.mknod:		$(RUMPSRC)/sbin/mknod
 				RUMPMAKE=$(RUMPMAKE) CC=$(CC) OUTDIR=$(OUTDIR) RUMPSRC=$(RUMPSRC) OBJDIR=$(OBJDIR) ./util.sh mknod $(RUMPSRC)/sbin/mknod $@
 
@@ -74,6 +78,12 @@ $(BINDIR)/rump.ping:		$(RUMPSRC)/sbin/ping
 
 $(BINDIR)/rump.ping6:		$(RUMPSRC)/sbin/ping6
 				RUMPMAKE=$(RUMPMAKE) CC=$(CC) OUTDIR=$(OUTDIR) RUMPSRC=$(RUMPSRC) OBJDIR=$(OBJDIR) ./util.sh ping6 $(RUMPSRC)/sbin/ping6 $@
+
+$(BINDIR)/rump.sysctl:		$(RUMPSRC)/sbin/sysctl
+				RUMPMAKE=$(RUMPMAKE) CC=$(CC) OUTDIR=$(OUTDIR) RUMPSRC=$(RUMPSRC) OBJDIR=$(OBJDIR) ./util.sh sysctl $(RUMPSRC)/sbin/sysctl $@
+
+$(BINDIR)/rump.uname:		$(RUMPSRC)/usr.bin/uname
+				RUMPMAKE=$(RUMPMAKE) CC=$(CC) OUTDIR=$(OUTDIR) RUMPSRC=$(RUMPSRC) OBJDIR=$(OBJDIR) ./util.sh uname $(RUMPSRC)/usr.bin/uname $@
 
 $(BINDIR)/rump.rtadvd:		$(RUMPSRC)/usr.sbin/rtadvd
 				RUMPMAKE=$(RUMPMAKE) CC=$(CC) OUTDIR=$(OUTDIR) RUMPSRC=$(RUMPSRC) OBJDIR=$(OBJDIR) ./util.sh rtadvd $(RUMPSRC)/usr.sbin/rtadvd $@

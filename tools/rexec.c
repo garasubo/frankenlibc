@@ -1,3 +1,7 @@
+#ifdef __Linux__
+#define _GNU_SOURCE
+#endif
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -129,7 +133,7 @@ main(int argc, char **argv)
 		} else {
 			fd = open(arg, mode);
 			if (fd == -1) {
-				perror("open");
+				fprintf(stderr, "open %s\n", strerror(errno));
 				exit(1);
 			}
 			fl = fcntl(fd, F_GETFL);
@@ -431,5 +435,4 @@ uuid()
 	}
 	uuid[d++] = 0;
 	setenv("UUID", uuid, 0);
-	fprintf(stderr, "%s\n", uuid);
 }

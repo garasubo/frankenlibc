@@ -31,7 +31,7 @@ HOST=$(uname -s)
 
 case ${HOST} in
 Linux)
-	NCPU=$(nproc)
+	NCPU=$(nproc 2>/dev/null || echo 1)
 	;;
 NetBSD)
 	NCPU=$(sysctl -n hw.ncpu)
@@ -316,6 +316,11 @@ rm -f ${RUMP}/lib/librumpdev_ubt.a
 rm -f ${RUMP}/lib/librumpkern_sys_linux.a
 rm -f ${RUMP}/lib/librumpdev_umass.a
 
+# remove crypto for now as very verbose
+rm -f ${RUMP}/lib/librumpkern_crypto.a
+rm -f ${RUMP}/lib/librumpdev_opencrypto.a
+rm -f ${RUMP}/lib/librumpdev_cgd.a
+
 # userspace libraries to build from NetBSD base
 USER_LIBS="m pthread z crypt util prop rmt ipsec"
 NETBSDLIBS="${RUMPSRC}/lib/libc"
@@ -575,21 +580,7 @@ CC="${BINDIR}/${COMPILER}" \
 	${MAKE} ${STDJ} -C tests
 
 # test for executable stack
-case ${OS} in
-qemu-arm|spike)
-	# does not have protection
-	;;
-twrls1021a)
-	# does not have protection
-	;;
-netbsd)
-	# XXX unclear why this is happening, needs investigating
-	readelf -lW ${RUMPOBJ}/tests/hello | grep RWE && echo "Writeable executable section (stack?) found"
-	;;
-*)
-	readelf -lW ${RUMPOBJ}/tests/hello | grep RWE && echo "Writeable executable section (stack?) found" && exit 1
-	;;
-esac
+readelf -lW ${RUMPOBJ}/tests/hello | grep RWE 1>&2 && echo "WARNING: writeable executable section (stack?) found" 1>&2
 
 if [ ${RUNTESTS} = "test" ]
 then
